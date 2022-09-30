@@ -126,9 +126,9 @@ class CKA:
         N = K.shape[0]
         ones = torch.ones(N, 1).to(self.device)
         result = torch.trace(K @ L)
-        result += ((ones.t() @ K @ ones @ ones.t() @ L @ ones) / ((N - 1) * (N - 2))).item()
-        result -= ((ones.t() @ K @ L @ ones) * 2 / (N - 2)).item()
-        return (1 / (N * (N - 3)) * result).item()
+        result += ((ones.t() @ K @ ones @ ones.t() @ L @ ones) / ((N - 1) * (N - 2))).item() #This doesnt need, ones/ones.t(). Consider using torch.sum(torch.sum(K,dim=1))*torch.sum(torch.sum(L,dim=1))
+        result -= ((ones.t() @ K @ L @ ones) * 2 / (N - 2)).item()   #also doesnt need ones. again something like torch.sum(K,dim=0)@torch.sum(L,dim=1). Much MUCH faster! 
+        return (1 / (N * (N - 3)) * result).item()  # I'm pretty sure the result/ N*N-3 is faster, and in any case (N*N-3) can be cancelled out later(see the /Num_batches point, or at the very least, can be applied as an array op)  
 
     def compare(self,
                 dataloader1: DataLoader,
@@ -151,22 +151,24 @@ class CKA:
         N = len(self.model1_layers) if self.model1_layers is not None else len(list(self.model1.modules()))
         M = len(self.model2_layers) if self.model2_layers is not None else len(list(self.model2.modules()))
 
-        self.hsic_matrix = torch.zeros(N, M, 3)
+        self.hsic_matrix = torch.zeros(N, M)
 
-        num_batches = min(len(dataloader1), len(dataloader1))
-
+        num_batches = min(len(dataloader1), len(dataloader2))
+        
         for (x1, *_), (x2, *_) in tqdm(zip(dataloader1, dataloader2), desc="| Comparing features |", total=num_batches):
 
             self.model1_features = {}
             self.model2_features = {}
-            _ = self.model1(x1.to(self.device))
-            _ = self.model2(x2.to(self.device))
-
+            x1=x1.to(self.device,non_blocking=True)
+            x2=x2.to(self.device,non_blocking=True)
+            self.model1(x1)
+            self.model2(x2)
+            del x1,x2
             for i, (name1, feat1) in enumerate(self.model1_features.items()):
                 X = feat1.flatten(1)
                 K = X @ X.t()
                 K.fill_diagonal_(0.0)
-                self.hsic_matrix[i, :, 0] += self._HSIC(K, K) / num_batches
+                self.hsic_matrix[i, :, 0] += self._HSIC(K, K) 
 
                 for j, (name2, feat2) in enumerate(self.model2_features.items()):
                     Y = feat2.flatten(1)
@@ -174,11 +176,11 @@ class CKA:
                     L.fill_diagonal_(0)
                     assert K.shape == L.shape, f"Feature shape mistach! {K.shape}, {L.shape}"
 
-                    self.hsic_matrix[i, j, 1] += self._HSIC(K, L) / num_batches
-                    self.hsic_matrix[i, j, 2] += self._HSIC(L, L) / num_batches
+                    self.hsic_matrix[i, j, 1] += self._HSIC(K, L) 
+                    self.hsic_matrix[i, j, 2] += self._HSIC(L, L) 
 
-        self.hsic_matrix = self.hsic_matrix[:, :, 1] / (self.hsic_matrix[:, :, 0].sqrt() *
-                                                        self.hsic_matrix[:, :, 2].sqrt())
+        self.hsic_matrix += self.hsic_matrix[:, :, 1] / (self.hsic_matrix[:, :, 0] *
+                                                        self.hsic_matrix[:, :, 2]).sqrt()
 
         assert not torch.isnan(self.hsic_matrix).any(), "HSIC computation resulted in NANs"
 
