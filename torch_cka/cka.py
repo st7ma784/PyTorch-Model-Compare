@@ -129,7 +129,21 @@ class CKA:
         result += ((ones.t() @ K @ ones @ ones.t() @ L @ ones) / ((N - 1) * (N - 2))).item() #This doesnt need, ones/ones.t(). Consider using torch.sum(torch.sum(K,dim=1))*torch.sum(torch.sum(L,dim=1))
         result -= ((ones.t() @ K @ L @ ones) * 2 / (N - 2)).item()   #also doesnt need ones. again something like torch.sum(K,dim=0)@torch.sum(L,dim=1). Much MUCH faster! 
         return (1 / (N * (N - 3)) * result).item()  # I'm pretty sure the result/ N*N-3 is faster, and in any case (N*N-3) can be cancelled out later(see the /Num_batches point, or at the very least, can be applied as an array op)  
+    def _BHSIC( K, L):
+    """
+    Computes the unbiased estimate of HSIC metric.
+    Reference: https://arxiv.org/pdf/2010.15327.pdf Eq (3)
+    """
+    with torch.no_grad():
+        N = K.shape[0]
 
+        resa=torch.div(torch.sum(torch.sum(K,dim=-2),dim=-1,keepdim=True),N-1)
+        resb=torch.div(torch.sum(torch.sum(L,dim=-2),dim=-1,keepdim=True),N-2)
+        result = resa@resb.t()
+        result = torch.add(result,torch.sum(torch.diagonal(torch.matmul(K.unsqueeze(1),L),dim1=-2,dim2=-1),dim=-1)) 
+        result= torch.sub(result,torch.mul(torch.sum(K,dim=-2)@torch.sum(L,dim=-1).t(),2 / (N - 2)))
+
+        return result
     def compare(self,
                 dataloader1: DataLoader,
                 dataloader2: DataLoader = None) -> None:
@@ -179,8 +193,7 @@ class CKA:
                     self.hsic_matrix[i, j, 1] += self._HSIC(K, L) 
                     self.hsic_matrix[i, j, 2] += self._HSIC(L, L) 
 
-        self.hsic_matrix += self.hsic_matrix[:, :, 1] / (self.hsic_matrix[:, :, 0] *
-                                                        self.hsic_matrix[:, :, 2]).sqrt()
+        self.hsic_matrix += self.hsic_matrix[:, :, 1] / (self.hsic_matrix[:, :, 0] *self.hsic_matrix[:, :, 2]).sqrt()
 
         assert not torch.isnan(self.hsic_matrix).any(), "HSIC computation resulted in NANs"
 
