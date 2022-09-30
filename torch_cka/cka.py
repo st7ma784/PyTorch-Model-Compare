@@ -6,9 +6,20 @@ from functools import partial
 from warnings import warn
 from typing import List, Dict
 import matplotlib.pyplot as plt
-from .utils import add_colorbar
+
+from mpl_toolkits import axes_grid1
+import matplotlib.pyplot as plt
 
 
+def add_colorbar(im, aspect=10, pad_fraction=0.5, **kwargs):
+    """Add a vertical color bar to an image plot."""
+    divider = axes_grid1.make_axes_locatable(im.axes)
+    width = axes_grid1.axes_size.AxesY(im.axes, aspect=1./aspect)
+    pad = axes_grid1.axes_size.Fraction(pad_fraction, width)
+    current_ax = plt.gca()
+    cax = divider.append_axes("right", size=width, pad=pad)
+    plt.sca(current_ax)
+    return im.axes.figure.colorbar(im, cax=cax, **kwargs)
 class CKA:
     def __init__(self,
                  model1: nn.Module,
@@ -73,27 +84,31 @@ class CKA:
         self.model2_layers = model2_layers
 
         self._insert_hooks()
-        self.model1 = self.model1.to(self.device)
-        self.model2 = self.model2.to(self.device)
+        # self.model1 = self.model1.to(self.device)
+        # self.model2 = self.model2.to(self.device)
 
         self.model1.eval()
         self.model2.eval()
-
     def _log_layer(self,
                    model: str,
                    name: str,
                    layer: nn.Module,
                    inp: torch.Tensor,
                    out: torch.Tensor):
+        with torch.no_grad():
+            if model == "model1":
+                X = out.flatten(1)
+                    
+                self.model1_features[name] = (X @ X.t()).fill_diagonal_(0)
 
-        if model == "model1":
-            self.model1_features[name] = out
+            elif model == "model2":
+                X = out.flatten(1)
+                    
+                self.model2_features[name] = (X @ X.t()).fill_diagonal_(0)
+                #self.model2_features[name] = out
 
-        elif model == "model2":
-            self.model2_features[name] = out
-
-        else:
-            raise RuntimeError("Unknown model name for _log_layer.")
+            else:
+                raise RuntimeError("Unknown model name for _log_layer.")
 
     def _insert_hooks(self):
         # Model 1
@@ -117,19 +132,54 @@ class CKA:
                 self.model2_info['Layers'] += [name]
                 layer.register_forward_hook(partial(self._log_layer, "model2", name))
 
-    def _HSIC(self, K, L):
+    def _BHSIC2(self, K):
         """
         Computes the unbiased estimate of HSIC metric.
+        Reference: https://arxiv.org/pdf/2010.15327.pdf Eq (3)
+        """
+        with torch.no_grad():
+            #print(K.shape)
 
+            N = K.shape[1]
+            result = torch.div(torch.pow(torch.sum(torch.sum(K,dim=-2),dim=-1),2),(N - 1) * (N - 2))#or sum(K)/N-1  * sum(K)/N-2
+            result = torch.add(result,torch.sum(torch.diagonal(torch.matmul(K,K),dim1=1,dim2=2),dim=1)) 
+            result = torch.sub(result,torch.mul(torch.sum(torch.mul(torch.sum(K,dim=-2),torch.sum(K,dim=-1)),dim=-1),2 / (N - 2)))
+            return result
+
+    def _BHSIC( self, K, L):
+        """
+        Computes the unbiased estimate of HSIC metric.
+        Reference: https://arxiv.org/pdf/2010.15327.pdf Eq (3)
+        """
+        with torch.no_grad():
+            N = K.shape[0]
+
+            
+            trace = torch.sum(torch.diagonal(torch.matmul(K.unsqueeze(1),L),dim1=-2,dim2=-1),dim=-1) 
+            resa=torch.div(torch.sum(torch.sum(K,dim=-2),dim=-1,keepdim=True),N-1)
+            resb=torch.sum(torch.sum(L,dim=-2),dim=-1,keepdim=True)
+            result= torch.sub(resa@resb.t(),torch.mul(torch.sum(K,dim=-2)@torch.sum(L,dim=-1).t(),2))
+
+            return torch.add(trace,result,alpha=1/(N-2))
+    # def _HSIC(self, K, L):
+    #     """
+    #     Computes the unbiased estimate of HSIC metric.
+
+    #     Reference: https://arxiv.org/pdf/2010.15327.pdf Eq (3)
+    #     """
+    #     with torch.no_grad():
+    #         N = K.shape[0]
+    #         comp = (torch.sum(torch.sum(K,dim=1)) * torch.sum(torch.sum(L,dim=1)) / (N - 1)) - ((torch.sum(K,dim=0) @ torch.sum(L,dim=1)) * 2)
+    #         result= torch.add(torch.trace(K@L),comp,alpha=1/(N - 2))
+    #     return result.item()
+    def _orig_HSIC(self, K, L):
+        """
+        Computes the unbiased estimate of HSIC metric.
         Reference: https://arxiv.org/pdf/2010.15327.pdf Eq (3)
         """
         N = K.shape[0]
-        ones = torch.ones(N, 1).to(self.device)
-        result = torch.trace(K @ L)
-        result += ((ones.t() @ K @ ones @ ones.t() @ L @ ones) / ((N - 1) * (N - 2))).item()
-        result -= ((ones.t() @ K @ L @ ones) * 2 / (N - 2)).item()
-        return (1 / (N * (N - 3)) * result).item()
-
+        return torch.trace(K@L).add(((torch.sum(K)*torch.sum(L))/(N - 1))-(torch.sum(K,dim=0)@torch.sum(L,dim=1)*2),alpha=1/(N-2))
+        #return result.item()
     def compare(self,
                 dataloader1: DataLoader,
                 dataloader2: DataLoader = None) -> None:
@@ -151,36 +201,84 @@ class CKA:
         N = len(self.model1_layers) if self.model1_layers is not None else len(list(self.model1.modules()))
         M = len(self.model2_layers) if self.model2_layers is not None else len(list(self.model2.modules()))
 
-        self.hsic_matrix = torch.zeros(N, M, 3)
+        self.hsic_matrix0 = torch.zeros(N)
+        self.hsic_matrix1 = torch.zeros(N, M)
+        self.hsic_matrix2 = torch.zeros(M)
 
-        num_batches = min(len(dataloader1), len(dataloader1))
+        num_batches = min(len(dataloader1), len(dataloader2))
 
         for (x1, *_), (x2, *_) in tqdm(zip(dataloader1, dataloader2), desc="| Comparing features |", total=num_batches):
 
             self.model1_features = {}
             self.model2_features = {}
-            _ = self.model1(x1.to(self.device))
-            _ = self.model2(x2.to(self.device))
 
-            for i, (name1, feat1) in enumerate(self.model1_features.items()):
-                X = feat1.flatten(1)
-                K = X @ X.t()
-                K.fill_diagonal_(0.0)
-                self.hsic_matrix[i, :, 0] += self._HSIC(K, K) / num_batches
+            x1=x1.to(self.device,non_blocking=True)
+            model=self.model1.to(self.device,non_blocking=True)
+            model(x1)
+            del x1 #free memory
+            model=self.model2.to(self.device,non_blocking=True)
+            x2=x2.to(self.device,non_blocking=True)
+            model(x2)
+            del x2,model#free memory
 
-                for j, (name2, feat2) in enumerate(self.model2_features.items()):
-                    Y = feat2.flatten(1)
-                    L = Y @ Y.t()
-                    L.fill_diagonal_(0)
+            for i,K in enumerate(self.model1_features.values()):
+                self.hsic_matrix0[i] += self._orig_HSIC(K, K).cpu()
+            for i,L in enumerate(self.model2_features.values()):
+                self.hsic_matrix2[i] += self._orig_HSIC(L, L).cpu()
+            for i,K in enumerate(self.model1_features.values()):            
+               for j,L in enumerate(self.model2_features.values()):
                     assert K.shape == L.shape, f"Feature shape mistach! {K.shape}, {L.shape}"
+                    self.hsic_matrix1[i, j] += self._orig_HSIC(K, L).cpu()
+                    #self.hsic_matrix[i, j, 2] += self._HSIC(L, L) / num_batches
 
-                    self.hsic_matrix[i, j, 1] += self._HSIC(K, L) / num_batches
-                    self.hsic_matrix[i, j, 2] += self._HSIC(L, L) / num_batches
+        self.hsic_matrix = self.hsic_matrix1 / (self.hsic_matrix0.unsqueeze(1).sqrt() *
+                                                        self.hsic_matrix2.unsqueeze(0).sqrt())
 
-        self.hsic_matrix = self.hsic_matrix[:, :, 1] / (self.hsic_matrix[:, :, 0].sqrt() *
-                                                        self.hsic_matrix[:, :, 2].sqrt())
+        
+        if not torch.isnan(self.hsic_matrix).any():
+            warn("HSIC computation resulted in NANs")
+    def Bcompare(self,
+                dataloader1: DataLoader,
+                dataloader2: DataLoader = None) -> None:
+        if dataloader2 is None:
+            warn("Dataloader for Model 2 is not given. Using the same dataloader for both models.")
+            dataloader2 = dataloader1
 
-        assert not torch.isnan(self.hsic_matrix).any(), "HSIC computation resulted in NANs"
+        self.model1_info['Dataset'] = dataloader1.dataset.__repr__().split('\n')[0]
+        self.model2_info['Dataset'] = dataloader2.dataset.__repr__().split('\n')[0]
+
+        N = len(self.model1_layers) if self.model1_layers is not None else len(list(self.model1.modules()))
+        M = len(self.model2_layers) if self.model2_layers is not None else len(list(self.model2.modules()))
+
+        self.hsic_matrix=torch.zeros(N,M)
+        num_batches = min(len(dataloader1), len(dataloader2))
+
+        for (x1, *_), (x2, *_) in tqdm(zip(dataloader1, dataloader2), desc="| Comparing features |", total=num_batches):
+
+            self.model1_features = {}
+            self.model2_features = {}
+
+            x1=x1.to(self.device,non_blocking=True)
+            model=self.model1.to(self.device,non_blocking=True)
+            model(x1)
+            del x1 #free memory
+            model=self.model2.to(self.device,non_blocking=True)
+            x2=x2.to(self.device,non_blocking=True)
+            model(x2)
+            del x2,model#free memory
+            features=list(self.model1_features.values())
+            features2=list(self.model2_features.values())
+            
+            m2_matrix=self._BHSIC2(torch.stack(features2,dim=0)).unsqueeze(0)#//(50 * (50 - 3))
+            m0_matrix=self._BHSIC2(torch.stack(features,dim=0)).unsqueeze(1)#/(50 * (50 - 3))
+            m1_matrix =self._BHSIC(torch.stack(features,dim=0),torch.stack(features2,dim=0))#/(50 * (50 - 3))
+            res_matrix = torch.div(m1_matrix, torch.sqrt(torch.abs(torch.mul(m0_matrix,m2_matrix)))).cpu()
+            self.hsic_matrix=torch.add(self.hsic_matrix,res_matrix)
+            #self.hsic_matrix = self.hsic_matrix[:, :, 1] / (self.hsic_matrix[:, :, 0].sqrt() *
+            #                                                        'self.hsic_matrix[:, :, 2].sqrt())
+
+        if not torch.isnan(self.hsic_matrix).any():
+            warn("HSIC computation resulted in NANs")
 
     def export(self) -> Dict:
         """
